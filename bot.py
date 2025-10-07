@@ -802,7 +802,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     PORT = int(os.environ.get("PORT", 10000))
-    PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-bot.onrender.com").strip()
+    PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://python-b-k9r3.onrender.com").strip()
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
