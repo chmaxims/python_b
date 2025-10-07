@@ -23,6 +23,7 @@ def init_db():
     global conn
     conn = psycopg2.connect(DATABASE_URL, sslmode="require")
     with conn.cursor() as cur:
+        # Создаём таблицы, если не существуют
         cur.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id SERIAL PRIMARY KEY,
@@ -35,7 +36,6 @@ def init_db():
                 user_id BIGINT NOT NULL,
                 user_name TEXT NOT NULL,
                 product_name TEXT NOT NULL,
-                photo_file_id TEXT,
                 rating TEXT NOT NULL CHECK (rating IN ('Отлично', 'Плохо')),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 category_id INTEGER NOT NULL REFERENCES categories(id)
@@ -48,6 +48,19 @@ def init_db():
                 is_banned BOOLEAN DEFAULT FALSE
             );
         """)
+
+        # === МИГРАЦИЯ: добавляем photo_file_id, если отсутствует ===
+        try:
+            cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
+            conn.commit()
+            print("✅ Добавлена колонка photo_file_id")
+        except psycopg2.errors.DuplicateColumn:
+            # Колонка уже существует — пропускаем
+            conn.rollback()
+        except Exception as e:
+            conn.rollback()
+            print(f"⚠️ Ошибка при добавлении photo_file_id: {e}")
+
         conn.commit()
     print("✅ PostgreSQL инициализирована")
 
