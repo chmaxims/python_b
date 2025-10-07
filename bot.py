@@ -1,29 +1,25 @@
-# bot.py — точная копия твоего main.py, адаптированная под Render + PostgreSQL + Webhook
+# bot.py — финальная версия для Render (как твой main.py, но с PostgreSQL)
 import os
 import psycopg2
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-
-# Загружаем переменные (на Render они задаются в интерфейсе)
+# Настройки
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-# Глобальное подключение к БД
 conn = None
 
 def init_db():
     global conn
     conn = psycopg2.connect(DATABASE_URL, sslmode="require")
     with conn.cursor() as cur:
-        # Создаём таблицы, если не существуют
         cur.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id SERIAL PRIMARY KEY,
@@ -36,6 +32,7 @@ def init_db():
                 user_id BIGINT NOT NULL,
                 user_name TEXT NOT NULL,
                 product_name TEXT NOT NULL,
+                photo_file_id TEXT,
                 rating TEXT NOT NULL CHECK (rating IN ('Отлично', 'Плохо')),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 category_id INTEGER NOT NULL REFERENCES categories(id)
@@ -49,20 +46,17 @@ def init_db():
             );
         """)
 
-        # === МИГРАЦИЯ: добавляем photo_file_id, если отсутствует ===
+        # Миграция: добавляем photo_file_id, если отсутствует
         try:
             cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
             conn.commit()
-            print("✅ Добавлена колонка photo_file_id")
         except psycopg2.errors.DuplicateColumn:
-            # Колонка уже существует — пропускаем
             conn.rollback()
         except Exception as e:
             conn.rollback()
-            print(f"⚠️ Ошибка при добавлении photo_file_id: {e}")
 
         conn.commit()
-    print("✅ PostgreSQL инициализирована")
+    print("✅ База данных инициализирована")
 
 # === Функции из main.py (адаптированы под PostgreSQL) ===
 
@@ -243,7 +237,7 @@ def format_category_list(mode=None):
         lines = [f"{i}. {name} — [{count}]" for i, (cat_id, name, count) in enumerate(categories, 1)]
         return "Выберите категорию:\n" + "\n".join(lines)
 
-# === Обработчики (полностью как в main.py) ===
+# === Обработчики команд ===
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -283,7 +277,6 @@ async def change_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not products:
         await update.message.reply_text("Нет товаров для перемещения.")
         return
-    # Исправлено: добавлено игнорирование 4-го элемента (created_at)
     lines = [f"{i}. {name} → {cat}" for i, (pid, name, cat, _) in enumerate(products, 1)]
     msg = "Выберите товар для перемещения:\n" + "\n".join(lines)
     await update.message.reply_text(msg)
@@ -390,9 +383,7 @@ async def show_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("Фото не найдено.")
         return
     name, created_at, user_name, rating, category_name, photo_file_id = row
-    # Форматируем дату вручную (как в SQLite)
-    date_str = created_at.strftime('%Y-%m-%d %H:%M:%S')
-    date_display = date_str[8:10] + '.' + date_str[5:7] + '.' + date_str[0:4]
+    date_display = created_at.strftime('%d.%m.%Y')
     caption = f"{name}\nКатегория: {category_name}\nОценка: {rating}\nДата: {date_display}\nАвтор: {user_name}"
     await context.bot.send_photo(chat_id=query.message.chat_id, photo=photo_file_id, caption=caption)
 
@@ -400,13 +391,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text("Привет!", reply_markup=get_main_menu(user_id))
 
+# === Основной обработчик текста ===
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.text:
         return
     text = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # Проверка на бан
     with conn.cursor() as cur:
         cur.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
@@ -425,13 +417,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{icon} Уведомления {status_text}.", reply_markup=get_main_menu(user_id))
         return
 
-    # === Админ-состояния с обработкой "Назад" ===
+    # === Админ-состояния ===
     admin_steps = ['selecting_user_to_delete', 'selecting_user_to_ban', 'selecting_user_to_unban']
     if current_state.get('step') in admin_steps:
         if text == "Назад":
-            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             if user_id in user_state:
                 del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
     if current_state.get('step') == 'selecting_user_to_delete':
@@ -513,7 +505,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.isdigit():
             idx = int(text)
             if 1 <= idx <= len(products):
-                product_id, _, _, _ = products[idx - 1]  # id, name, cat, created_at
+                product_id, _, _, _ = products[idx - 1]
                 cat_list = get_categories()
                 if not cat_list:
                     await update.message.reply_text("Нет категорий для перемещения.")
@@ -550,23 +542,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_state[user_id]
         return
 
-    if current_state.get('step') == 'selecting_category_to_rename':
-        categories = get_categories()
-        if text.isdigit():
-            idx = int(text)
-            if 1 <= idx <= len(categories):
-                cat_id, cat_name = categories[idx - 1]
-                await update.message.reply_text(f"Текущее название: {cat_name}\nВведите новое название:")
-                user_state[user_id] = {
-                    'step': 'entering_new_category_name',
-                    'category_id': cat_id
-                }
-            else:
-                await update.message.reply_text("Неверный номер категории.")
-        else:
-            await update.message.reply_text("Введите номер категории.")
-        return
-
     if current_state.get('step') == 'selecting_new_category_for_product':
         cat_list = current_state.get('categories', [])
         if text.isdigit():
@@ -598,9 +573,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_state.get('step') in ['choosing_category_for_add', 'choosing_category_for_view']:
         if text == "Назад":
-            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             if user_id in user_state:
                 del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
         categories = get_categories()
@@ -627,9 +602,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for p in products:
                             name = p['product_name']
                             created_at = p['created_at']
-                            # Форматируем дату как в SQLite
-                            date_str = created_at.strftime('%Y-%m-%d %H:%M:%S')
-                            date_display = date_str[8:10] + '.' + date_str[5:7] + '.' + date_str[0:4]
+                            date_display = created_at.strftime('%d.%m.%Y')
                             user_name = p['user_name']
                             product_id = p['id']
                             photo_exists = p.get('photo_file_id') is not None
@@ -660,9 +633,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_state.get('step') == 'awaiting_product_name':
         if text == "Назад":
-            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             if user_id in user_state:
                 del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
         photo_file_id = None
@@ -693,9 +666,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_state.get('step') == 'awaiting_rating':
         if text == "Назад":
-            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             if user_id in user_state:
                 del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
         if text in ["Отлично", "Плохо"]:
@@ -753,6 +726,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
 
+# === Обработчик фото ===
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         return
@@ -790,9 +765,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Пожалуйста, используйте кнопки меню.")
 
+# === Запуск ===
+
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear_all", clear_all_command))
     app.add_handler(CommandHandler("change_cat", change_cat_command))
@@ -801,14 +779,12 @@ def main():
     app.add_handler(CommandHandler("del_user", del_user_command))
     app.add_handler(CommandHandler("ban_user", ban_user_command))
     app.add_handler(CommandHandler("unban_user", unban_user_command))
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(show_photo_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Webhook для Render
+    PORT = int(os.environ.get("PORT", 10000))
     PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-bot.onrender.com").strip()
-    PORT = int(os.environ.get("PORT", 8000))
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
