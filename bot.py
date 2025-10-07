@@ -550,6 +550,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_state[user_id]
         return
 
+    if current_state.get('step') == 'selecting_category_to_rename':
+        categories = get_categories()
+        if text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(categories):
+                cat_id, cat_name = categories[idx - 1]
+                await update.message.reply_text(f"Текущее название: {cat_name}\nВведите новое название:")
+                user_state[user_id] = {
+                    'step': 'entering_new_category_name',
+                    'category_id': cat_id
+                }
+            else:
+                await update.message.reply_text("Неверный номер категории.")
+        else:
+            await update.message.reply_text("Введите номер категории.")
+        return
+
     if current_state.get('step') == 'selecting_new_category_for_product':
         cat_list = current_state.get('categories', [])
         if text.isdigit():
