@@ -300,7 +300,7 @@ async def del_position_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not products:
         await update.message.reply_text("Нет товаров для удаления.")
         return
-    lines = [f"{i}. {name} → {cat} — {date.split(' ')[0].replace('-', '.')}"
+    lines = [f"{i}. {name} → {cat} — {date.strftime('%d.%m.%Y')}"
              for i, (pid, name, cat, date) in enumerate(products, 1)]
     msg = "Выберите товар для удаления:\n" + "\n".join(lines)
     await update.message.reply_text(msg)
@@ -513,7 +513,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.isdigit():
             idx = int(text)
             if 1 <= idx <= len(products):
-                product_id, _, _ = products[idx - 1]
+                product_id, _, _, _ = products[idx - 1]  # id, name, cat, created_at
                 cat_list = get_categories()
                 if not cat_list:
                     await update.message.reply_text("Нет категорий для перемещения.")
