@@ -283,7 +283,8 @@ async def change_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not products:
         await update.message.reply_text("Нет товаров для перемещения.")
         return
-    lines = [f"{i}. {name} → {cat}" for i, (pid, name, cat) in enumerate(products, 1)]
+    # Исправлено: добавлено игнорирование 4-го элемента (created_at)
+    lines = [f"{i}. {name} → {cat}" for i, (pid, name, cat, _) in enumerate(products, 1)]
     msg = "Выберите товар для перемещения:\n" + "\n".join(lines)
     await update.message.reply_text(msg)
     user_state[update.effective_user.id] = {
