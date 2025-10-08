@@ -828,7 +828,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_state[user_id]['category_id'] = selected_category_id
                     user_state[user_id]['step'] = 'awaiting_product_name'
                     await update.message.reply_text(
-                        "Введите название товара:",
+                        "Прикрепите фотографию и введите название товара:",
                         reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
                     )
                 elif mode in ['recommend', 'avoid']:
