@@ -1,8 +1,6 @@
 # bot.py — финальная версия для Render (обновлено: безопасность, надежность, health-check)
 import os
-import threading
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -999,37 +997,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, используйте кнопки меню.")
 
 
-# === Health-check сервер для UpTimeRobot ===
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health"):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        # Подавляем логи health-check запросов
-        return
-
-
-def start_health_server(port):
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
-
 # === Запуск ===
 
 def main():
     init_db()
-
-    # Запуск health-check сервера в фоновом потоке
-    PORT = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=start_health_server, args=(PORT,), daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -1044,6 +1015,9 @@ def main():
     app.add_handler(CallbackQueryHandler(show_photo_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+
+    PORT = int(os.environ.get("PORT", 10000))
 
     PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
     if not PUBLIC_URL:
