@@ -1,8 +1,16 @@
-# bot.py — финальная версия для Render (как твой main.py, но с PostgreSQL)
+# bot.py — финальная версия для Render (обновлено: безопасность, надежность, health-check)
 import os
+import threading
+import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import psycopg2
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.error import TelegramError
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Настройки
 TOKEN = os.getenv("BOT_TOKEN")
@@ -14,162 +22,277 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-conn = None
+
+# === Вспомогательные функции для работы с БД ===
+
+def get_db_connection():
+    """Создаёт новое соединение с БД. Использовать в контекстном менеджере."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def is_user_banned(user_id):
+    """Проверяет, забанен ли пользователь (кроме админа)."""
+    if user_id == ADMIN_USER_ID:
+        return False
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else False
+    except Exception as e:
+        logger.error(f"Ошибка при проверке бана пользователя {user_id}: {e}")
+        return False
+
+
+def ensure_user_exists(user_id):
+    """Гарантирует, что пользователь есть в таблице users."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (user_id, notifications_enabled)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (user_id, True))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при создании пользователя {user_id}: {e}")
+
+
+# === Функции работы с БД (обновлены: соединение на каждый вызов) ===
 
 def init_db():
-    global conn
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS categories (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                user_name TEXT NOT NULL,
-                product_name TEXT NOT NULL,
-                photo_file_id TEXT,
-                rating TEXT NOT NULL CHECK (rating IN ('Отлично', 'Плохо')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                category_id INTEGER NOT NULL REFERENCES categories(id)
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                notifications_enabled BOOLEAN DEFAULT TRUE,
-                is_banned BOOLEAN DEFAULT FALSE
-            );
-        """)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS categories (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS products (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        user_name TEXT NOT NULL,
+                        product_name TEXT NOT NULL,
+                        photo_file_id TEXT,
+                        rating TEXT NOT NULL CHECK (rating IN ('Отлично', 'Плохо')),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        category_id INTEGER NOT NULL REFERENCES categories(id)
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        notifications_enabled BOOLEAN DEFAULT TRUE,
+                        is_banned BOOLEAN DEFAULT FALSE
+                    );
+                """)
 
-        # Миграция: добавляем photo_file_id, если отсутствует
-        try:
-            cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
-            conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
-        except Exception as e:
-            conn.rollback()
+                # Миграция: добавляем photo_file_id, если отсутствует
+                try:
+                    cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
+                    conn.commit()
+                except psycopg2.errors.DuplicateColumn:
+                    pass  # Колонка уже существует
+                except Exception as e:
+                    logger.warning(f"Ошибка при миграции photo_file_id: {e}")
+                    conn.rollback()
 
-        conn.commit()
-    print("✅ База данных инициализирована")
+                conn.commit()
+        print("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+        raise
 
-# === Функции из main.py (адаптированы под PostgreSQL) ===
 
 def get_notification_status(user_id):
-    with conn.cursor() as cur:
-        cur.execute("SELECT notifications_enabled FROM users WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if row is None:
-            cur.execute("INSERT INTO users (user_id, notifications_enabled) VALUES (%s, %s)", (user_id, True))
-            conn.commit()
-            return True
-        return row[0]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT notifications_enabled FROM users WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute("INSERT INTO users (user_id, notifications_enabled) VALUES (%s, %s)", (user_id, True))
+                    conn.commit()
+                    return True
+                return row[0]
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса уведомлений {user_id}: {e}")
+        return True
+
 
 def toggle_notifications(user_id):
     current = get_notification_status(user_id)
     new_status = not current
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO users (user_id, notifications_enabled)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET notifications_enabled = %s
-        """, (user_id, new_status, new_status))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (user_id, notifications_enabled)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET notifications_enabled = %s
+                """, (user_id, new_status, new_status))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при переключении уведомлений {user_id}: {e}")
     return new_status
 
+
 def get_subscribers(exclude_user_id=None):
-    with conn.cursor() as cur:
-        if exclude_user_id is not None:
-            cur.execute("SELECT user_id FROM users WHERE notifications_enabled = TRUE AND user_id != %s", (exclude_user_id,))
-        else:
-            cur.execute("SELECT user_id FROM users WHERE notifications_enabled = TRUE")
-        return [row[0] for row in cur.fetchall()]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if exclude_user_id is not None:
+                    cur.execute("SELECT user_id FROM users WHERE notifications_enabled = TRUE AND user_id != %s",
+                                (exclude_user_id,))
+                else:
+                    cur.execute("SELECT user_id FROM users WHERE notifications_enabled = TRUE")
+                return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Ошибка при получении подписчиков: {e}")
+        return []
+
 
 def get_categories():
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM categories ORDER BY name")
-        return cur.fetchall()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name FROM categories ORDER BY name")
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка при получении категорий: {e}")
+        return []
+
 
 def add_category(name):
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,))
-        cur.execute("SELECT id FROM categories WHERE name = %s", (name,))
-        conn.commit()
-        return cur.fetchone()[0]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,))
+                cur.execute("SELECT id FROM categories WHERE name = %s", (name,))
+                conn.commit()
+                return cur.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении категории '{name}': {e}")
+        return None
+
 
 def save_product(user_id, user_name, category_id, product_name, rating, photo_file_id=None):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO products (user_id, user_name, category_id, product_name, photo_file_id, rating)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (user_id, user_name, category_id, product_name, photo_file_id, rating))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO products (user_id, user_name, category_id, product_name, photo_file_id, rating)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (user_id, user_name, category_id, product_name, photo_file_id, rating))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении товара: {e}")
+
 
 def get_products_by_category_and_rating(category_id, rating):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT product_name, created_at, user_name, id, photo_file_id
-            FROM products 
-            WHERE category_id = %s AND rating = %s
-            ORDER BY created_at DESC
-        """, (category_id, rating))
-        columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row)) for row in cur.fetchall()]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT product_name, created_at, user_name, id, photo_file_id
+                    FROM products 
+                    WHERE category_id = %s AND rating = %s
+                    ORDER BY created_at DESC
+                """, (category_id, rating))
+                columns = [desc[0] for desc in cur.description]
+                return [dict(zip(columns, row)) for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Ошибка при получении товаров по категории {category_id} и оценке {rating}: {e}")
+        return []
+
 
 def get_all_products_with_categories():
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT p.id, p.product_name, c.name, p.created_at
-            FROM products p 
-            JOIN categories c ON p.category_id = c.id
-            ORDER BY c.name, p.product_name
-        """)
-        return cur.fetchall()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id, p.product_name, c.name, p.created_at
+                    FROM products p 
+                    JOIN categories c ON p.category_id = c.id
+                    ORDER BY c.name, p.product_name
+                """)
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка при получении всех товаров: {e}")
+        return []
+
 
 def get_all_users():
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT u.user_id, p.user_name
-            FROM users u
-            LEFT JOIN products p ON u.user_id = p.user_id
-            GROUP BY u.user_id, p.user_name
-            ORDER BY u.user_id
-        """)
-        users = cur.fetchall()
-        unique_users = {}
-        for user_id, name in users:
-            if user_id not in unique_users:
-                unique_users[user_id] = name or "Неизвестно"
-        return list(unique_users.items())
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT u.user_id, p.user_name
+                    FROM users u
+                    LEFT JOIN products p ON u.user_id = p.user_id
+                    GROUP BY u.user_id, p.user_name
+                    ORDER BY u.user_id
+                """)
+                users = cur.fetchall()
+                unique_users = {}
+                for user_id, name in users:
+                    if user_id not in unique_users:
+                        unique_users[user_id] = name or "Неизвестно"
+                return list(unique_users.items())
+    except Exception as e:
+        logger.error(f"Ошибка при получении всех пользователей: {e}")
+        return []
+
 
 def update_category_name(category_id, new_name):
-    with conn.cursor() as cur:
-        cur.execute("UPDATE categories SET name = %s WHERE id = %s", (new_name, category_id))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE categories SET name = %s WHERE id = %s", (new_name, category_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при переименовании категории {category_id}: {e}")
+
 
 def move_product_to_category(product_id, new_category_id):
-    with conn.cursor() as cur:
-        cur.execute("UPDATE products SET category_id = %s WHERE id = %s", (new_category_id, product_id))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE products SET category_id = %s WHERE id = %s", (new_category_id, product_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при перемещении товара {product_id}: {e}")
+
 
 def delete_product(product_id):
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при удалении товара {product_id}: {e}")
+
 
 def clear_all_data():
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM products")
-        cur.execute("DELETE FROM categories")
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products")
+                cur.execute("DELETE FROM categories")
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при очистке БД: {e}")
 
-# === Глобальное состояние (как в main.py) ===
+
+# === Глобальное состояние ===
 user_state = {}
+
 
 def get_main_menu(user_id=None):
     if user_id is not None:
@@ -182,6 +305,7 @@ def get_main_menu(user_id=None):
         ["✅   Покупать", "❌   Не покупать"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
 
 def get_category_keyboard(show_other=False, show_back=False):
     categories = get_categories()
@@ -205,40 +329,63 @@ def get_category_keyboard(show_other=False, show_back=False):
         buttons = [["Назад"]]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
+
 def format_category_list(mode=None):
-    with conn.cursor() as cur:
-        if mode == 'recommend':
-            cur.execute("""
-                SELECT c.id, c.name, COUNT(p.id) as product_count
-                FROM categories c
-                LEFT JOIN products p ON c.id = p.category_id AND p.rating = 'Отлично'
-                GROUP BY c.id, c.name
-                ORDER BY c.name
-            """)
-        elif mode == 'avoid':
-            cur.execute("""
-                SELECT c.id, c.name, COUNT(p.id) as product_count
-                FROM categories c
-                LEFT JOIN products p ON c.id = p.category_id AND p.rating = 'Плохо'
-                GROUP BY c.id, c.name
-                ORDER BY c.name
-            """)
-        else:
-            cur.execute("""
-                SELECT c.id, c.name, COUNT(p.id) as product_count
-                FROM categories c
-                LEFT JOIN products p ON c.id = p.category_id
-                GROUP BY c.id, c.name
-                ORDER BY c.name
-            """)
-        categories = cur.fetchall()
-        if not categories:
-            return "Нет категорий."
-        lines = [f"{i}. {name} — [{count}]" for i, (cat_id, name, count) in enumerate(categories, 1)]
-        return "Выберите категорию:\n" + "\n".join(lines)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if mode == 'recommend':
+                    cur.execute("""
+                        SELECT c.id, c.name, COUNT(p.id) as product_count
+                        FROM categories c
+                        LEFT JOIN products p ON c.id = p.category_id AND p.rating = 'Отлично'
+                        GROUP BY c.id, c.name
+                        ORDER BY c.name
+                    """)
+                elif mode == 'avoid':
+                    cur.execute("""
+                        SELECT c.id, c.name, COUNT(p.id) as product_count
+                        FROM categories c
+                        LEFT JOIN products p ON c.id = p.category_id AND p.rating = 'Плохо'
+                        GROUP BY c.id, c.name
+                        ORDER BY c.name
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT c.id, c.name, COUNT(p.id) as product_count
+                        FROM categories c
+                        LEFT JOIN products p ON c.id = p.category_id
+                        GROUP BY c.id, c.name
+                        ORDER BY c.name
+                    """)
+                categories = cur.fetchall()
+                if not categories:
+                    return "Нет категорий."
+                lines = [f"{i}. {name} — [{count}]" for i, (cat_id, name, count) in enumerate(categories, 1)]
+                return "Выберите категорию:\n" + "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Ошибка при форматировании списка категорий: {e}")
+        return "Ошибка при загрузке категорий."
+
+
+# === Декоратор для проверки бана в командах ===
+
+def banned_user_check(func):
+    """Декоратор для команд: блокирует забаненных пользователей."""
+
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if is_user_banned(user_id):
+            await update.message.reply_text("❌ Доступ запрещён.")
+            return
+        return await func(update, context)
+
+    return wrapper
+
 
 # === Обработчики команд ===
 
+@banned_user_check
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🛠️ Админ-команды:\n\n"
@@ -252,10 +399,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text)
 
+
+@banned_user_check
 async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Доступ запрещён.")
+        return
     clear_all_data()
     await update.message.reply_text("🗑️ База данных очищена.")
 
+
+@banned_user_check
 async def change_cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -269,6 +423,8 @@ async def change_cat_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg)
     user_state[update.effective_user.id] = {'step': 'selecting_category_to_rename'}
 
+
+@banned_user_check
 async def change_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -285,6 +441,8 @@ async def change_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         'products': products
     }
 
+
+@banned_user_check
 async def del_position_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -302,6 +460,8 @@ async def del_position_command(update: Update, context: ContextTypes.DEFAULT_TYP
         'products': products
     }
 
+
+@banned_user_check
 async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -321,6 +481,8 @@ async def del_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'users': users
     }
 
+
+@banned_user_check
 async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -340,22 +502,35 @@ async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'users': users
     }
 
+
+@banned_user_check
 async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
-    with conn.cursor() as cur:
-        cur.execute("SELECT user_id FROM users WHERE is_banned = TRUE")
-        banned_ids = [row[0] for row in cur.fetchall()]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users WHERE is_banned = TRUE")
+                banned_ids = [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Ошибка при получении забаненных: {e}")
+        banned_ids = []
+
     if not banned_ids:
         await update.message.reply_text("Нет забаненных пользователей.")
         return
     users = []
     for uid in banned_ids:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_name FROM products WHERE user_id = %s LIMIT 1", (uid,))
-            name = cur.fetchone()
-            users.append((uid, name[0] if name else "Неизвестно"))
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_name FROM products WHERE user_id = %s LIMIT 1", (uid,))
+                    name = cur.fetchone()
+                    users.append((uid, name[0] if name else "Неизвестно"))
+        except Exception as e:
+            logger.error(f"Ошибка при получении имени забаненного {uid}: {e}")
+            users.append((uid, "Неизвестно"))
     lines = [f"{i}. {name} (ID: {user_id})" for i, (user_id, name) in enumerate(users, 1)]
     msg = "Выберите пользователя для разблокировки:\n" + "\n".join(lines)
     await update.message.reply_text(
@@ -367,29 +542,48 @@ async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         'users': users
     }
 
+
 async def show_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    product_id = int(query.data.split("_")[2])
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT p.product_name, p.created_at, p.user_name, p.rating, c.name as category_name, p.photo_file_id
-            FROM products p
-            JOIN categories c ON p.category_id = c.id
-            WHERE p.id = %s
-        """, (product_id,))
-        row = cur.fetchone()
-    if not row or not row[5]:
-        await query.message.reply_text("Фото не найдено.")
+    try:
+        product_id = int(query.data.split("_")[2])
+    except (ValueError, IndexError):
+        await query.message.reply_text("Некорректный запрос.")
         return
-    name, created_at, user_name, rating, category_name, photo_file_id = row
-    date_display = created_at.strftime('%d.%m.%Y')
-    caption = f"{name}\nКатегория: {category_name}\nОценка: {rating}\nДата: {date_display}\nАвтор: {user_name}"
-    await context.bot.send_photo(chat_id=query.message.chat_id, photo=photo_file_id, caption=caption)
 
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.product_name, p.created_at, p.user_name, p.rating, c.name as category_name, p.photo_file_id
+                    FROM products p
+                    JOIN categories c ON p.category_id = c.id
+                    WHERE p.id = %s
+                """, (product_id,))
+                row = cur.fetchone()
+        if not row or not row[5]:
+            await query.message.reply_text("Фото не найдено.")
+            return
+        name, created_at, user_name, rating, category_name, photo_file_id = row
+        date_display = created_at.strftime('%d.%m.%Y')
+        caption = f"{name}\nКатегория: {category_name}\nОценка: {rating}\nДата: {date_display}\nАвтор: {user_name}"
+        try:
+            await context.bot.send_photo(chat_id=query.message.chat_id, photo=photo_file_id, caption=caption)
+        except TelegramError as e:
+            logger.error(f"Ошибка отправки фото: {e}")
+            await query.message.reply_text("Не удалось загрузить фото.")
+    except Exception as e:
+        logger.error(f"Ошибка в show_photo_callback: {e}")
+        await query.message.reply_text("Произошла ошибка при загрузке фото.")
+
+
+@banned_user_check
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    ensure_user_exists(user_id)
     await update.message.reply_text("Привет!", reply_markup=get_main_menu(user_id))
+
 
 # === Основной обработчик текста ===
 
@@ -399,14 +593,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-    if row and row[0] and user_id != ADMIN_USER_ID:
+    # Проверка бана (уже не нужно — декораторы для команд, а здесь обработка кнопок)
+    if is_user_banned(user_id) and user_id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
 
-    get_notification_status(user_id)
+    ensure_user_exists(user_id)
     current_state = user_state.get(user_id, {})
 
     # Обработка кнопки уведомлений
@@ -432,11 +624,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text)
             if 1 <= idx <= len(users):
                 target_id, _ = users[idx - 1]
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM products WHERE user_id = %s", (target_id,))
-                    cur.execute("DELETE FROM users WHERE user_id = %s", (target_id,))
-                    conn.commit()
-                await update.message.reply_text(f"Пользователь {target_id} удалён.")
+                try:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("DELETE FROM products WHERE user_id = %s", (target_id,))
+                            cur.execute("DELETE FROM users WHERE user_id = %s", (target_id,))
+                            conn.commit()
+                    await update.message.reply_text(f"Пользователь {target_id} удалён.")
+                except Exception as e:
+                    logger.error(f"Ошибка удаления пользователя {target_id}: {e}")
+                    await update.message.reply_text("Ошибка при удалении пользователя.")
             else:
                 await update.message.reply_text("Неверный номер.")
         else:
@@ -445,23 +642,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_state[user_id]
         return
 
-            #=== Обработка изменения категории ===
+    # === Обработка изменения категории ===
     if current_state.get('step') == 'selecting_category_to_rename':
-            categories = get_categories()
-            if text.isdigit():
-                idx = int(text)
-                if 1 <= idx <= len(categories):
-                    cat_id, cat_name = categories[idx - 1]
-                    await update.message.reply_text(f"Текущее название: {cat_name}\nВведите новое название:")
-                    user_state[user_id] = {
-                        'step': 'entering_new_category_name',
-                        'category_id': cat_id
-                    }
-                else:
-                    await update.message.reply_text("Неверный номер категории.")
+        categories = get_categories()
+        if text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(categories):
+                cat_id, cat_name = categories[idx - 1]
+                await update.message.reply_text(f"Текущее название: {cat_name}\nВведите новое название:")
+                user_state[user_id] = {
+                    'step': 'entering_new_category_name',
+                    'category_id': cat_id
+                }
             else:
-                await update.message.reply_text("Введите номер категории.")
-            return
+                await update.message.reply_text("Неверный номер категории.")
+        else:
+            await update.message.reply_text("Введите номер категории.")
+        return
 
     if current_state.get('step') == 'selecting_user_to_ban':
         users = current_state.get('users', [])
@@ -469,14 +666,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text)
             if 1 <= idx <= len(users):
                 target_id, _ = users[idx - 1]
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO users (user_id, is_banned)
-                        VALUES (%s, TRUE)
-                        ON CONFLICT (user_id) DO UPDATE SET is_banned = TRUE
-                    """, (target_id,))
-                    conn.commit()
-                await update.message.reply_text(f"Пользователь {target_id} забанен.")
+                try:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO users (user_id, is_banned)
+                                VALUES (%s, TRUE)
+                                ON CONFLICT (user_id) DO UPDATE SET is_banned = TRUE
+                            """, (target_id,))
+                            conn.commit()
+                    await update.message.reply_text(f"Пользователь {target_id} забанен.")
+                except Exception as e:
+                    logger.error(f"Ошибка бана пользователя {target_id}: {e}")
+                    await update.message.reply_text("Ошибка при блокировке пользователя.")
             else:
                 await update.message.reply_text("Неверный номер.")
         else:
@@ -491,14 +693,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text)
             if 1 <= idx <= len(users):
                 target_id, _ = users[idx - 1]
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO users (user_id, is_banned)
-                        VALUES (%s, FALSE)
-                        ON CONFLICT (user_id) DO UPDATE SET is_banned = FALSE
-                    """, (target_id,))
-                    conn.commit()
-                await update.message.reply_text(f"Пользователь {target_id} разбанен.")
+                try:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO users (user_id, is_banned)
+                                VALUES (%s, FALSE)
+                                ON CONFLICT (user_id) DO UPDATE SET is_banned = FALSE
+                            """, (target_id,))
+                            conn.commit()
+                    await update.message.reply_text(f"Пользователь {target_id} разбанен.")
+                except Exception as e:
+                    logger.error(f"Ошибка разбана пользователя {target_id}: {e}")
+                    await update.message.reply_text("Ошибка при разблокировке пользователя.")
             else:
                 await update.message.reply_text("Неверный номер.")
         else:
@@ -579,6 +786,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_state.get('step') == 'adding_category':
         if text.strip():
             category_id = add_category(text.strip())
+            if category_id is None:
+                await update.message.reply_text("Ошибка при создании категории. Попробуйте снова.")
+                return
             user_state[user_id] = {
                 'step': 'choosing_category_for_add',
                 'mode': 'add'
@@ -677,7 +887,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "Выберите оценку:",
-            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
+                                             one_time_keyboard=False)
         )
         user_state[user_id] = {'step': 'awaiting_rating'}
         return
@@ -696,9 +907,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_file_id = context.user_data.get('photo_file_id')
             save_product(user_id, user_name, category_id, product_name, text, photo_file_id)
 
-            with conn.cursor() as cur:
-                cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
-                category_name = cur.fetchone()[0]
+            try:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT name FROM categories WHERE id = %s", (category_id,))
+                        category_name = cur.fetchone()[0]
+            except Exception as e:
+                logger.error(f"Ошибка получения имени категории {category_id}: {e}")
+                category_name = "Неизвестно"
 
             subscribers = get_subscribers(exclude_user_id=user_id)
             for sub_id in subscribers:
@@ -708,7 +924,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"🆕 Новый товар в категории «{category_name}»:\n• {product_name} — {text}\n(добавил: {user_name})"
                     )
                 except Exception as e:
-                    print(f"Не удалось отправить уведомление пользователю {sub_id}: {e}")
+                    logger.error(f"Не удалось отправить уведомление пользователю {sub_id}: {e}")
 
             await update.message.reply_text("Товар сохранён!", reply_markup=get_main_menu(user_id))
         else:
@@ -744,6 +960,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
 
+
 # === Обработчик фото ===
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -751,14 +968,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-    if row and row[0] and user_id != ADMIN_USER_ID:
+    if is_user_banned(user_id) and user_id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
 
-    get_notification_status(user_id)
+    ensure_user_exists(user_id)
     current_state = user_state.get(user_id, {})
 
     if current_state.get('step') == 'awaiting_product_name':
@@ -777,16 +991,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "Выберите оценку:",
-            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
+                                             one_time_keyboard=False)
         )
         user_state[user_id] = {'step': 'awaiting_rating'}
     else:
         await update.message.reply_text("Пожалуйста, используйте кнопки меню.")
 
+
+# === Health-check сервер для UpTimeRobot ===
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Подавляем логи health-check запросов
+        return
+
+
+def start_health_server(port):
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 # === Запуск ===
 
 def main():
     init_db()
+
+    # Запуск health-check сервера в фоновом потоке
+    PORT = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=start_health_server, args=(PORT,), daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -801,13 +1045,16 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    PORT = int(os.environ.get("PORT", 10000))
-    PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://python-b-k9r3.onrender.com").strip()
+    PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if not PUBLIC_URL:
+        raise RuntimeError("RENDER_EXTERNAL_URL not set")
+
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=PUBLIC_URL
     )
+
 
 if __name__ == "__main__":
     main()
