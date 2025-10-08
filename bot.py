@@ -226,6 +226,22 @@ def get_all_products_with_categories():
         logger.error(f"Ошибка при получении всех товаров: {e}")
         return []
 
+def get_user_products(user_id):
+    """Получает список товаров текущего пользователя с категориями."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id, p.product_name, c.name, p.created_at, p.photo_file_id
+                    FROM products p
+                    JOIN categories c ON p.category_id = c.id
+                    WHERE p.user_id = %s
+                    ORDER BY p.created_at DESC
+                """, (user_id,))
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка при получении товаров пользователя {user_id}: {e}")
+        return []
 
 def get_all_users():
     try:
@@ -386,14 +402,16 @@ def banned_user_check(func):
 @banned_user_check
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "🛠️ Админ-команды:\n\n"
-        "/clear_all — очистить всю базу данных\n"
+        "🛠️ Пользовательские команды:\n\n"
         "/change_cat — изменить название категории\n"
         "/change_list — переместить товар в другую категорию\n"
+        "/edit_product — изменить свой товар\n"
         "/del_position — удалить товар из списка\n"
+        "🛠️ Админ-команды:\n\n"
         "/del_user <id> — удалить пользователя\n"
         "/ban_user <id> — забанить пользователя\n"
         "/unban_user <id> — разбанить пользователя\n"
+        "/clear_all — очистить всю базу данных\n"
     )
     await update.message.reply_text(help_text)
 
@@ -540,6 +558,26 @@ async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         'users': users
     }
 
+async def edit_product_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    products = get_user_products(user_id)
+    if not products:
+        await update.message.reply_text("У вас нет добавленных товаров.")
+        return
+
+    lines = [
+        f"{i}. {name} → {cat} — {date.strftime('%d.%m.%Y')}"
+        for i, (pid, name, cat, date, photo) in enumerate(products, 1)
+    ]
+    msg = "Выберите товар для редактирования:\n" + "\n".join(lines)
+    await update.message.reply_text(
+        msg,
+        reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+    )
+    user_state[user_id] = {
+        'step': 'selecting_product_to_edit',
+        'products': products
+    }
 
 async def show_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -787,6 +825,84 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_state[user_id]
         return
 
+    if current_state.get('step') == 'selecting_product_to_edit':
+        if text == "Назад":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
+            return
+
+        products = current_state.get('products', [])
+        if text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(products):
+                product_id, _, _, _, _ = products[idx - 1]
+                keyboard = [["Изменить название", "Изменить фото"], ["Назад"]]
+                await update.message.reply_text(
+                    "Что вы хотите изменить?",
+                    reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+                )
+                user_state[user_id] = {
+                    'step': 'choosing_edit_field',
+                    'product_id': product_id
+                }
+            else:
+                await update.message.reply_text("Неверный номер товара.")
+        else:
+            await update.message.reply_text("Введите номер товара.")
+        return
+
+    if current_state.get('step') == 'choosing_edit_field':
+        if text == "Назад":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
+            return
+
+        product_id = current_state.get('product_id')
+        if text == "Изменить название":
+            await update.message.reply_text(
+                "Введите новое название товара:",
+                reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            )
+            user_state[user_id] = {
+                'step': 'editing_product_name',
+                'product_id': product_id
+            }
+        elif text == "Изменить фото":
+            await update.message.reply_text(
+                "Отправьте новое фото (можно без подписи):",
+                reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            )
+            user_state[user_id] = {
+                'step': 'editing_product_photo',
+                'product_id': product_id
+            }
+        else:
+            await update.message.reply_text("Пожалуйста, выберите действие.")
+        return
+
+    if current_state.get('step') == 'editing_product_name':
+        if text == "Назад":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
+            return
+
+        product_id = current_state.get('product_id')
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE products SET product_name = %s WHERE id = %s", (text.strip(), product_id))
+                    conn.commit()
+            await update.message.reply_text("✅ Название товара обновлено!")
+        except Exception as e:
+            logger.error(f"Ошибка обновления названия товара {product_id}: {e}")
+            await update.message.reply_text("❌ Не удалось обновить название.")
+        if user_id in user_state:
+            del user_state[user_id]
+        return
+
     if current_state.get('step') == 'adding_category':
         if text == "Назад":
             if user_id in user_state:
@@ -871,33 +987,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if current_state.get('step') == 'awaiting_product_name':
+        if not update.message.caption:
+            user_state[user_id] = user_state.get(user_id, {})
+            user_state[user_id]['photo_file_id'] = update.message.photo[-1].file_id
+            await update.message.reply_text(
+                "Пожалуйста, укажите название товара (добавьте подпись к фото).",
+                reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            )
+            return
+
+        photo_file_id = update.message.photo[-1].file_id
+        product_name = update.message.caption.strip()
+
+        user_state[user_id] = user_state.get(user_id, {})
+        user_state[user_id]['product_name'] = product_name
+        user_state[user_id]['photo_file_id'] = photo_file_id
+        user_state[user_id]['step'] = 'awaiting_rating'
+
+        await update.message.reply_text(
+            "Выберите оценку:",
+            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+        )
+
+    elif current_state.get('step') == 'editing_product_photo':
         if text == "Назад":
             if user_id in user_state:
                 del user_state[user_id]
             await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
-        # Проверяем, было ли загружено фото ранее
-        photo_file_id = current_state.get('photo_file_id')
-
-        if photo_file_id is not None:
-            # Фото уже есть — этот текст является названием для него
-            product_name = text
-            user_state[user_id]['product_name'] = product_name
-            # photo_file_id остаётся тем же
-        else:
-            # Фото не было — это текстовый товар
-            product_name = text
-            user_state[user_id]['product_name'] = product_name
-            user_state[user_id]['photo_file_id'] = None
-
-        await update.message.reply_text(
-            "Выберите оценку:",
-            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
-                                             one_time_keyboard=False)
-        )
-        user_state[user_id]['step'] = 'awaiting_rating'
-        return
+        photo_file_id = update.message.photo[-1].file_id
+        product_id = current_state.get('product_id')
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE products SET photo_file_id = %s WHERE id = %s", (photo_file_id, product_id))
+                    conn.commit()
+            await update.message.reply_text("✅ Фото товара обновлено!")
+        except Exception as e:
+            logger.error(f"Ошибка обновления фото товара {product_id}: {e}")
+            await update.message.reply_text("❌ Не удалось обновить фото.")
+        if user_id in user_state:
+            del user_state[user_id]
 
     if current_state.get('step') == 'awaiting_rating':
         if text == "Назад":
@@ -1032,6 +1163,7 @@ def main():
     app.add_handler(CommandHandler("del_user", del_user_command))
     app.add_handler(CommandHandler("ban_user", ban_user_command))
     app.add_handler(CommandHandler("unban_user", unban_user_command))
+    app.add_handler(CommandHandler("edit_product", edit_product_command))
     app.add_handler(CallbackQueryHandler(show_photo_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
