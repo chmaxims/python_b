@@ -911,7 +911,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
                                              one_time_keyboard=False)
         )
-        user_state[user_id] = {'step': 'awaiting_rating'}
+        user_state[user_id]['step'] = 'awaiting_rating'
         return
 
     if current_state.get('step') == 'awaiting_rating':
