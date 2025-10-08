@@ -1,4 +1,4 @@
-# bot.py — финальная версия для Render (исправлены 3 проблемы + безопасность)
+# bot.py — финальная версия для Render (все проблемы исправлены)
 import os
 import logging
 import psycopg2
@@ -58,7 +58,7 @@ def ensure_user_exists(user_id):
         logger.error(f"Ошибка при создании пользователя {user_id}: {e}")
 
 
-# === Функции работы с БД (обновлены: соединение на каждый вызов) ===
+# === Функции работы с БД ===
 
 def init_db():
     try:
@@ -90,7 +90,6 @@ def init_db():
                     );
                 """)
 
-                # Миграция: добавляем photo_file_id, если отсутствует
                 try:
                     cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
                     conn.commit()
@@ -167,6 +166,9 @@ def get_categories():
 
 
 def add_category(name):
+    # Запрет системных имён
+    if name.strip() in {"Назад", "Другое"}:
+        return None
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -205,7 +207,7 @@ def get_products_by_category_and_rating(category_id, rating):
                 columns = [desc[0] for desc in cur.description]
                 return [dict(zip(columns, row)) for row in cur.fetchall()]
     except Exception as e:
-        logger.error(f"Ошибка при получении товаров по категории {category_id} и оценке {rating}: {e}")
+        logger.error(f"Ошибка при получении товаров: {e}")
         return []
 
 
@@ -366,11 +368,9 @@ def format_category_list(mode=None):
         return "Ошибка при загрузке категорий."
 
 
-# === Декоратор для проверки бана в командах ===
+# === Декоратор для проверки бана ===
 
 def banned_user_check(func):
-    """Декоратор для команд: блокирует забаненных пользователей."""
-
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if is_user_banned(user_id):
@@ -596,15 +596,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ensure_user_exists(user_id)
-    # current_state = user_state.get(user_id, {})
 
-    # === Сброс состояния при нажатии кнопок главного меню (Исправление проблемы 3) ===
+    # === Сброс состояния при нажатии кнопок главного меню ===
     main_menu_triggers = ["➕   Добавить товар", "✅   Покупать", "❌   Не покупать", "🔔", "🔕", "я Лена"]
     if text in main_menu_triggers:
         if user_id in user_state:
             del user_state[user_id]
-        # Продолжаем выполнение — обработка в конце функции
 
+    # Получаем АКТУАЛЬНОЕ состояние ПОСЛЕ возможного сброса
     current_state = user_state.get(user_id, {})
 
     # Обработка кнопки уведомлений
@@ -648,7 +647,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del user_state[user_id]
         return
 
-    # === Обработка изменения категории ===
     if current_state.get('step') == 'selecting_category_to_rename':
         categories = get_categories()
         if text.isdigit():
@@ -790,7 +788,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if current_state.get('step') == 'adding_category':
-        # === Исправление проблемы 2: "Назад" не создаёт категорию ===
         if text == "Назад":
             if user_id in user_state:
                 del user_state[user_id]
@@ -800,12 +797,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.strip():
             category_id = add_category(text.strip())
             if category_id is None:
-                await update.message.reply_text("Ошибка при создании категории. Попробуйте снова.")
+                await update.message.reply_text("Недопустимое название категории. Попробуйте снова.")
                 return
-            user_state[user_id] = {
-                'step': 'choosing_category_for_add',
-                'mode': 'add'
-            }
+            user_state[user_id] = user_state.get(user_id, {})
+            user_state[user_id]['step'] = 'choosing_category_for_add'
+            user_state[user_id]['mode'] = 'add'
             msg = format_category_list()
             await update.message.reply_text(msg, reply_markup=get_category_keyboard(show_other=True, show_back=True))
         else:
@@ -827,13 +823,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mode = current_state['mode']
 
                 if mode == 'add':
-                    # Изменено: сохраняем category_id в user_state, а не в context.user_data
+                    # Сохраняем category_id в user_state (не перезаписываем!)
+                    user_state[user_id] = user_state.get(user_id, {})
                     user_state[user_id]['category_id'] = selected_category_id
+                    user_state[user_id]['step'] = 'awaiting_product_name'
                     await update.message.reply_text(
                         "Введите название товара:",
                         reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
                     )
-                    user_state[user_id]['step'] = 'awaiting_product_name'
                 elif mode in ['recommend', 'avoid']:
                     rating = 'Отлично' if mode == 'recommend' else 'Плохо'
                     products = get_products_by_category_and_rating(selected_category_id, rating)
@@ -880,31 +877,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
-        # === Исправление проблемы 1: фото сохраняется в user_state ===
+        # Проверяем, было ли загружено фото ранее
         photo_file_id = current_state.get('photo_file_id')
-        product_name = None
 
-        if update.message.photo:
-            if update.message.caption:
-                photo_file_id = update.message.photo[-1].file_id
-                product_name = update.message.caption.strip()
-                user_state[user_id]['product_name'] = product_name
-                user_state[user_id]['photo_file_id'] = photo_file_id
-            else:
-                await update.message.reply_text(
-                    "Пожалуйста, укажите название товара (добавьте подпись к фото).",
-                    reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
-                )
-                return
-        else:
-            # Пользователь ввёл текст — это название товара
+        if photo_file_id is not None:
+            # Фото уже есть — этот текст является названием для него
             product_name = text
-            # Сбрасываем фото, если вводим текст
-            if 'photo_file_id' in user_state[user_id]:
-                del user_state[user_id]['photo_file_id']
-            photo_file_id = None
             user_state[user_id]['product_name'] = product_name
-            user_state[user_id]['photo_file_id'] = photo_file_id
+            # photo_file_id остаётся тем же
+        else:
+            # Фото не было — это текстовый товар
+            product_name = text
+            user_state[user_id]['product_name'] = product_name
+            user_state[user_id]['photo_file_id'] = None
 
         await update.message.reply_text(
             "Выберите оценку:",
@@ -1005,25 +990,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_state.get('step') == 'awaiting_product_name':
         if not update.message.caption:
+            # Сохраняем фото, но остаёмся в том же состоянии
+            user_state[user_id] = user_state.get(user_id, {})
+            user_state[user_id]['photo_file_id'] = update.message.photo[-1].file_id
             await update.message.reply_text(
                 "Пожалуйста, укажите название товара (добавьте подпись к фото).",
                 reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
             )
-            return
+            return  # Не меняем шаг!
 
+        # Фото с подписью — сохраняем всё сразу
         photo_file_id = update.message.photo[-1].file_id
         product_name = update.message.caption.strip()
 
-        # === Исправление проблемы 1: сохраняем в user_state ===
+        user_state[user_id] = user_state.get(user_id, {})
         user_state[user_id]['product_name'] = product_name
         user_state[user_id]['photo_file_id'] = photo_file_id
+        user_state[user_id]['step'] = 'awaiting_rating'
 
         await update.message.reply_text(
             "Выберите оценку:",
             reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
                                              one_time_keyboard=False)
         )
-        user_state[user_id] = {'step': 'awaiting_rating'}
     else:
         await update.message.reply_text("Пожалуйста, используйте кнопки меню.")
 
