@@ -596,7 +596,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ensure_user_exists(user_id)
-    current_state = user_state.get(user_id, {})
+    # current_state = user_state.get(user_id, {})
 
     # === Сброс состояния при нажатии кнопок главного меню (Исправление проблемы 3) ===
     main_menu_triggers = ["➕   Добавить товар", "✅   Покупать", "❌   Не покупать", "🔔", "🔕", "я Лена"]
@@ -604,6 +604,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in user_state:
             del user_state[user_id]
         # Продолжаем выполнение — обработка в конце функции
+
+    current_state = user_state.get(user_id, {})
 
     # Обработка кнопки уведомлений
     if text in ("🔔", "🔕"):
@@ -825,12 +827,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mode = current_state['mode']
 
                 if mode == 'add':
+                    # Изменено: сохраняем category_id в user_state, а не в context.user_data
                     user_state[user_id]['category_id'] = selected_category_id
                     await update.message.reply_text(
                         "Введите название товара:",
                         reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
                     )
-                    user_state[user_id] = {'step': 'awaiting_product_name'}
+                    user_state[user_id]['step'] = 'awaiting_product_name'
                 elif mode in ['recommend', 'avoid']:
                     rating = 'Отлично' if mode == 'recommend' else 'Плохо'
                     products = get_products_by_category_and_rating(selected_category_id, rating)
