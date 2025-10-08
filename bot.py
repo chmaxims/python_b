@@ -406,7 +406,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/change_cat — изменить название категории\n"
         "/change_list — переместить товар в другую категорию\n"
         "/edit_product — изменить свой товар\n"
-        "/del_position — удалить товар из списка\n"
+        "/del_position — удалить товар из списка\n\n"
         "🛠️ Админ-команды:\n\n"
         "/del_user <id> — удалить пользователя\n"
         "/ban_user <id> — забанить пользователя\n"
@@ -987,27 +987,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if current_state.get('step') == 'awaiting_product_name':
-        if not update.message.caption:
-            user_state[user_id] = user_state.get(user_id, {})
-            user_state[user_id]['photo_file_id'] = update.message.photo[-1].file_id
-            await update.message.reply_text(
-                "Пожалуйста, укажите название товара (добавьте подпись к фото).",
-                reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
-            )
+        if text == "Назад":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
-        photo_file_id = update.message.photo[-1].file_id
-        product_name = update.message.caption.strip()
+        # В handle_text мы получаем ТОЛЬКО текст — фото обрабатывается в handle_photo
+        photo_file_id = current_state.get('photo_file_id')
 
-        user_state[user_id] = user_state.get(user_id, {})
-        user_state[user_id]['product_name'] = product_name
-        user_state[user_id]['photo_file_id'] = photo_file_id
-        user_state[user_id]['step'] = 'awaiting_rating'
+        if photo_file_id is not None:
+            # Фото уже загружено ранее — этот текст = название для него
+            product_name = text
+            user_state[user_id]['product_name'] = product_name
+            # photo_file_id остаётся
+        else:
+            # Чисто текстовый товар
+            product_name = text
+            user_state[user_id]['product_name'] = product_name
+            user_state[user_id]['photo_file_id'] = None
 
         await update.message.reply_text(
             "Выберите оценку:",
-            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True, one_time_keyboard=False)
+            reply_markup=ReplyKeyboardMarkup([["Отлично", "Плохо"], ["Назад"]], resize_keyboard=True,
+                                             one_time_keyboard=False)
         )
+        user_state[user_id]['step'] = 'awaiting_rating'
+        return
 
     elif current_state.get('step') == 'editing_product_photo':
         if text == "Назад":
