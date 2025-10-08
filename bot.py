@@ -1,4 +1,4 @@
-# bot.py — финальная версия для Render (обновлено: безопасность, надежность, health-check)
+# bot.py — финальная версия для Render (исправлены 3 проблемы + безопасность)
 import os
 import logging
 import psycopg2
@@ -24,7 +24,7 @@ if not DATABASE_URL:
 # === Вспомогательные функции для работы с БД ===
 
 def get_db_connection():
-    """Создаёт новое соединение с БД. Использовать в контекстном менеджере."""
+    """Создаёт новое соединение с БД."""
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
@@ -95,7 +95,7 @@ def init_db():
                     cur.execute("ALTER TABLE products ADD COLUMN photo_file_id TEXT;")
                     conn.commit()
                 except psycopg2.errors.DuplicateColumn:
-                    pass  # Колонка уже существует
+                    pass
                 except Exception as e:
                     logger.warning(f"Ошибка при миграции photo_file_id: {e}")
                     conn.rollback()
@@ -591,13 +591,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # Проверка бана (уже не нужно — декораторы для команд, а здесь обработка кнопок)
     if is_user_banned(user_id) and user_id != ADMIN_USER_ID:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
 
     ensure_user_exists(user_id)
     current_state = user_state.get(user_id, {})
+
+    # === Сброс состояния при нажатии кнопок главного меню (Исправление проблемы 3) ===
+    main_menu_triggers = ["➕   Добавить товар", "✅   Покупать", "❌   Не покупать", "🔔", "🔕", "я Лена"]
+    if text in main_menu_triggers:
+        if user_id in user_state:
+            del user_state[user_id]
+        # Продолжаем выполнение — обработка в конце функции
 
     # Обработка кнопки уведомлений
     if text in ("🔔", "🔕"):
@@ -782,6 +788,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if current_state.get('step') == 'adding_category':
+        # === Исправление проблемы 2: "Назад" не создаёт категорию ===
+        if text == "Назад":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
+            return
+
         if text.strip():
             category_id = add_category(text.strip())
             if category_id is None:
@@ -812,7 +825,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mode = current_state['mode']
 
                 if mode == 'add':
-                    context.user_data['category_id'] = selected_category_id
+                    user_state[user_id]['category_id'] = selected_category_id
                     await update.message.reply_text(
                         "Введите название товара:",
                         reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True, one_time_keyboard=False)
@@ -864,13 +877,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Выберите действие:", reply_markup=get_main_menu(user_id))
             return
 
-        photo_file_id = None
+        # === Исправление проблемы 1: фото сохраняется в user_state ===
+        photo_file_id = current_state.get('photo_file_id')
         product_name = None
 
         if update.message.photo:
             if update.message.caption:
                 photo_file_id = update.message.photo[-1].file_id
                 product_name = update.message.caption.strip()
+                user_state[user_id]['product_name'] = product_name
+                user_state[user_id]['photo_file_id'] = photo_file_id
             else:
                 await update.message.reply_text(
                     "Пожалуйста, укажите название товара (добавьте подпись к фото).",
@@ -878,10 +894,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         else:
+            # Пользователь ввёл текст — это название товара
             product_name = text
-
-        context.user_data['product_name'] = product_name
-        context.user_data['photo_file_id'] = photo_file_id
+            # Сбрасываем фото, если вводим текст
+            if 'photo_file_id' in user_state[user_id]:
+                del user_state[user_id]['photo_file_id']
+            photo_file_id = None
+            user_state[user_id]['product_name'] = product_name
+            user_state[user_id]['photo_file_id'] = photo_file_id
 
         await update.message.reply_text(
             "Выберите оценку:",
@@ -899,10 +919,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text in ["Отлично", "Плохо"]:
-            product_name = context.user_data.get('product_name', 'Неизвестно')
-            category_id = context.user_data.get('category_id')
+            product_name = current_state.get('product_name', 'Неизвестно')
+            category_id = current_state.get('category_id')
             user_name = update.effective_user.full_name or "Неизвестно"
-            photo_file_id = context.user_data.get('photo_file_id')
+            photo_file_id = current_state.get('photo_file_id')
+
+            if not category_id:
+                await update.message.reply_text("Ошибка: категория не выбрана. Начните заново.")
+                if user_id in user_state:
+                    del user_state[user_id]
+                return
+
             save_product(user_id, user_name, category_id, product_name, text, photo_file_id)
 
             try:
@@ -984,8 +1011,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file_id = update.message.photo[-1].file_id
         product_name = update.message.caption.strip()
 
-        context.user_data['product_name'] = product_name
-        context.user_data['photo_file_id'] = photo_file_id
+        # === Исправление проблемы 1: сохраняем в user_state ===
+        user_state[user_id]['product_name'] = product_name
+        user_state[user_id]['photo_file_id'] = photo_file_id
 
         await update.message.reply_text(
             "Выберите оценку:",
@@ -1016,9 +1044,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-
     PORT = int(os.environ.get("PORT", 10000))
-
     PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
     if not PUBLIC_URL:
         raise RuntimeError("RENDER_EXTERNAL_URL not set")
