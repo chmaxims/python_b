@@ -664,6 +664,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_exists(user_id)
     await update.message.reply_text("Привет!", reply_markup=get_main_menu(user_id))
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in user_state:
+        del user_state[user_id]
+    await update.message.reply_text("❌ Операция отменена.", reply_markup=get_main_menu(user_id))
+
 @banned_user_check
 async def help_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -705,13 +711,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Получаем АКТУАЛЬНОЕ состояние ПОСЛЕ возможного сброса
     current_state = user_state.get(user_id, {})
-
-    # Обработка отмены для админских операций
-    if text == "/cancel":
-        if user_id in user_state:
-            del user_state[user_id]
-        await update.message.reply_text("❌ Рассылка отменена.", reply_markup=get_main_menu(user_id))
-        return
 
     # Обработка кнопки уведомлений
     if text in ("🔔", "🔕"):
@@ -1266,6 +1265,7 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear_all", clear_all_command))
     app.add_handler(CommandHandler("change_cat", change_cat_command))
@@ -1276,6 +1276,7 @@ def main():
     app.add_handler(CommandHandler("unban_user", unban_user_command))
     app.add_handler(CommandHandler("edit_product", edit_product_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+
     app.add_handler(CallbackQueryHandler(show_photo_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
