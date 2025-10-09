@@ -153,6 +153,16 @@ def get_subscribers(exclude_user_id=None):
         logger.error(f"Ошибка при получении подписчиков: {e}")
         return []
 
+def get_all_active_user_ids():
+    """Возвращает список ID всех пользователей, кроме забаненных."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users WHERE is_banned = FALSE")
+                return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка пользователей для рассылки: {e}")
+        return []
 
 def get_categories():
     try:
@@ -417,6 +427,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ban_user <id> — забанить пользователя\n"
         "/unban_user <id> — разбанить пользователя\n"
         "/clear_all — очистить всю базу данных\n"
+        "/broadcast — отправить сообщение всем пользователям\n"
     )
     await update.message.reply_text(help_text)
 
@@ -563,6 +574,18 @@ async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         'users': users
     }
 
+@banned_user_check
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Доступ запрещён.")
+        return
+
+    await update.message.reply_text(
+        "📩 Введите сообщение для рассылки всем пользователям:\n\n"
+        "Отправьте /cancel, чтобы отменить.",
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False)
+    )
+    user_state[update.effective_user.id] = {'step': 'awaiting_broadcast_message'}
 
 @banned_user_check
 async def edit_product_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,6 +705,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Получаем АКТУАЛЬНОЕ состояние ПОСЛЕ возможного сброса
     current_state = user_state.get(user_id, {})
+
+    # Обработка отмены для админских операций
+    if text == "/cancel":
+        if user_id in user_state:
+            del user_state[user_id]
+        await update.message.reply_text("❌ Рассылка отменена.", reply_markup=get_main_menu(user_id))
+        return
 
     # Обработка кнопки уведомлений
     if text in ("🔔", "🔕"):
@@ -941,6 +971,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка обновления названия товара {product_id}: {e}")
             await update.message.reply_text("❌ Не удалось обновить название.")
+        if user_id in user_state:
+            del user_state[user_id]
+        return
+
+    if current_state.get('step') == 'awaiting_broadcast_message':
+        if text == "/cancel":
+            if user_id in user_state:
+                del user_state[user_id]
+            await update.message.reply_text("❌ Рассылка отменена.", reply_markup=get_main_menu(user_id))
+            return
+
+        # Получаем всех активных пользователей
+        user_ids = get_all_active_user_ids()
+        success_count = 0
+        error_count = 0
+
+        for uid in user_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Не удалось отправить рассылку пользователю {uid}: {e}")
+                error_count += 1
+
+        await update.message.reply_text(
+            f"✅ Рассылка завершена!\n"
+            f"Успешно: {success_count}\n"
+            f"Ошибок: {error_count}",
+            reply_markup=get_main_menu(user_id)
+        )
         if user_id in user_state:
             del user_state[user_id]
         return
@@ -1215,6 +1275,7 @@ def main():
     app.add_handler(CommandHandler("ban_user", ban_user_command))
     app.add_handler(CommandHandler("unban_user", unban_user_command))
     app.add_handler(CommandHandler("edit_product", edit_product_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(show_photo_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
